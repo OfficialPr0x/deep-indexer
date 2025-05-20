@@ -1,0 +1,75 @@
+# SpecterWire - Default Configuration
+
+# Analyzer engine configuration
+analyzer_config:
+  # Maximum number of worker threads
+  max_workers: 4
+  
+  # Maximum file size to analyze (100MB)
+  max_file_size: 104857600
+  
+  # DeepSeek integration configuration
+  deepseek_config:
+    # Use offline mode (no network requests)
+    use_offline_mode: true
+    
+    # Cache directory for analysis results
+    cache_dir: ~/.specterwire/cache
+    
+    # Analysis modules to enable
+    analysis_modules:
+      - entropy
+      - structure
+      - semantic
+      - patterns
+    
+    # Timeout for analysis operations (seconds)
+    timeout: 30
+    
+    # Batch size for streaming analysis (1MB)
+    batch_size: 1000000
+
+# GUI configuration
+gui_config:
+  # Theme (dark or light)
+  theme: dark
+  
+  # Default view on startup
+  default_view: dashboard
+  
+  # Maximum number of log entries to keep
+  max_log_entries: 1000
+  
+  # Enable file content preview
+  enable_content_preview: true
+  
+  # Auto-refresh interval (milliseconds)
+  refresh_interval: 1000
+
+# Plugin system configuration
+plugin_config:
+  # Enable plugin system
+  enabled: true
+  
+  # Plugin directory
+  plugin_dir: plugins
+  
+  # Enable automatic plugin loading
+  auto_load: true
+  
+  # Plugin execution timeout (seconds)
+  plugin_timeout: 10
+
+# Logging configuration
+logging_config:
+  # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  level: INFO
+  
+  # Log file path
+  file: ~/.specterwire/logs/specterwire.log
+  
+  # Maximum log file size (10MB)
+  max_size: 10485760
+  
+  # Maximum number of backup log files
+  backup_count: 5 

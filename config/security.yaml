@@ -1,0 +1,24 @@
+# Missing in core/monitoring/
+class Telemetry:
+    def send_metrics(self):
+        # OpenTelemetry integration
+        # Prometheus endpoint
+
+# Missing health checks:
+- /healthz endpoint
+- readiness/liveness probes
+- performance baselines 
+
+file_handling:
+  max_file_size: 104857600  # 100MB in bytes
+  banned_extensions: [".exe", ".dll", ".bat", ".sh", ".js"]
+  sanitization_rules:
+    strip_null_bytes: true
+    max_path_depth: 10
+
+auth:
+  jwt_secret: ${JWT_SECRET}
+  oidc_providers:
+    azure_ad:
+      tenant_id: ${AZ_TENANT}
+      client_id: ${AZ_CLIENT} 
