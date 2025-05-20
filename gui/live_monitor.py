@@ -1,357 +1,339 @@
+import os
+import sys
 import time
+import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, 
-    QPushButton, QLabel, QComboBox, QCheckBox,
-    QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QLineEdit
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit,
+    QScrollArea, QFrame, QSplitter, QTableWidget, QTableWidgetItem,
+    QHeaderView, QProgressBar, QListWidget, QListWidgetItem
 )
-from PySide6.QtCore import Qt, Signal, Slot, QTimer
-from PySide6.QtGui import QColor, QTextCursor, QFont
-import logging
-from gui.timeline_view import TimelineView
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QThread
+from PySide6.QtGui import QFont, QColor, QTextCursor
 
+# Configure logging
 logger = logging.getLogger('SpecterWire.LiveMonitor')
 
-class LogEntry:
-    """Individual log entry for the live monitor"""
+class LogOutputWidget(QTextEdit):
+    """Widget that displays formatted log output with syntax highlighting."""
     
-    def __init__(self, message: str, timestamp: float = None, 
-                severity: str = "INFO", category: str = "SYSTEM"):
-        self.message = message
-        self.timestamp = timestamp or time.time()
-        self.severity = severity.upper()
-        self.category = category.upper()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QTextEdit.NoWrap)
+        # Use monospace font
+        self.setFont(QFont("Consolas", 9))
+        # Customize appearance
+        self.setStyleSheet("""
+            background-color: #1e1e1e;
+            color: #f0f0f0;
+            border: none;
+        """)
+    
+    def add_log_entry(self, message, severity="INFO"):
+        """Add a log entry with appropriate color based on severity."""
+        # Define colors for different log levels
+        colors = {
+            "DEBUG": "#9A9A9A",     # Gray
+            "INFO": "#FFFFFF",      # White
+            "WARNING": "#FFC107",   # Yellow
+            "ERROR": "#F44336",     # Red
+            "SUCCESS": "#4CAF50",   # Green
+            "MEDIUM": "#FFC107",    # Yellow (for alerts)
+            "HIGH": "#F44336",      # Red (for alerts)
+            "CRITICAL": "#D32F2F"   # Dark Red
+        }
         
-        # Formatted timestamp
-        self.formatted_time = datetime.fromtimestamp(self.timestamp).strftime('%H:%M:%S.%f')[:-3]
+        # Get color based on severity (defaulting to white if not found)
+        color = colors.get(severity.upper(), "#FFFFFF")
+        
+        # Get current timestamp
+        timestamp = time.strftime('%H:%M:%S')
+        
+        # Add formatted message to log
+        self._append_to_log(f"<span style='color:#777777'>[{timestamp}]</span> "
+                           f"<span style='color:{color}'>{message}</span>")
     
-    def get_color(self) -> Tuple[int, int, int]:
-        """Get RGB color based on severity"""
-        if self.severity == "HIGH":
-            return (244, 67, 54)  # Red
-        elif self.severity == "MEDIUM":
-            return (255, 152, 0)  # Orange
-        elif self.severity == "LOW":
-            return (76, 175, 80)  # Green
-        elif self.severity == "WARNING":
-            return (255, 193, 7)  # Yellow
-        elif self.severity == "ERROR":
-            return (244, 67, 54)  # Red
-        else:
-            return (255, 255, 255)  # White
-    
-    def get_html(self) -> str:
-        """Get HTML formatted string for log entry"""
-        r, g, b = self.get_color()
-        return (f'<div style="margin: 1px 0px; color: rgb({r},{g},{b});">'
-                f'<span style="color: gray;">[{self.formatted_time}]</span> '
-                f'<span style="color: rgb(100,181,246);">[{self.severity}]</span> '
-                f'{self.message}'
-                f'</div>')
+    def _append_to_log(self, html_text):
+        """Thread-safe method to append text to the log."""
+        # Get cursor at the end
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        
+        # Insert HTML-formatted text
+        cursor.insertHtml(html_text + "<br>")
+        
+        # Auto-scroll to the latest entry
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
 
 class LiveMonitorWidget(QWidget):
     """
-    Live monitoring widget for real-time event tracking
+    Widget displaying real-time file scanning results and activity logs.
+    
+    This widget provides a live view of the scanning process, including
+    file analysis results, warnings, and system status.
     """
     
-    def __init__(self, parent=None, config=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         
-        # Store configuration
-        self.config = config or {}
+        # Setup UI
+        self.setup_ui()
         
-        # Initialize log storage
-        self.log_entries = []
-        self.filtered_entries = []
-        self.max_entries = 1000  # Maximum number of entries to keep
-        
-        # Set up UI
-        self._setup_ui()
-        
-        # Set up filters
-        self._setup_filters()
-        
-        # Set up colors for different severity levels
-        self.severity_colors = {
-            "ERROR": QColor(244, 67, 54),      # Red
-            "WARNING": QColor(255, 152, 0),    # Orange
-            "CRITICAL": QColor(183, 28, 28),   # Dark Red
-            "INFO": QColor(255, 255, 255),     # White
-            "DEBUG": QColor(158, 158, 158),    # Gray
-            "SUCCESS": QColor(76, 175, 80),    # Green
-            "HIGH": QColor(244, 67, 54),       # Red for high anomaly
-            "MEDIUM": QColor(255, 152, 0),     # Orange for medium anomaly
-            "LOW": QColor(76, 175, 80)         # Green for low anomaly
+        # Local state
+        self.files_processed = 0
+        self.start_time = None
+        self.file_counts = {
+            "LOW": 0,
+            "MEDIUM": 0, 
+            "HIGH": 0,
+            "CRITICAL": 0
         }
         
-        # No timer here - we'll update the timeline directly when needed
-    
-    def _setup_ui(self):
-        """Set up the user interface"""
+        # Ensure thread safety for timer operations
+        self.main_thread = QThread.currentThread()
+        
+        # Set up update timer (for refreshing statistics)
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_statistics)
+        self.update_timer.start(1000)  # Update once per second
+        
+    def setup_ui(self):
+        """Set up the UI components."""
         # Main layout
-        main_layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         
-        # Controls layout
-        control_layout = QHBoxLayout()
-        
-        # Filter controls
-        filter_label = QLabel("Filter:")
-        self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter logs...")
-        self.filter_input.textChanged.connect(self._apply_filters)
-        
-        # Severity filter
-        severity_label = QLabel("Severity:")
-        self.severity_filter = QComboBox()
-        self.severity_filter.addItems(["All Levels", "ERROR", "WARNING", "INFO", "DEBUG", "SUCCESS"])
-        self.severity_filter.currentTextChanged.connect(self._apply_filters)
-        
-        # Auto-scroll checkbox
-        self.auto_scroll = QCheckBox("Auto-scroll")
-        self.auto_scroll.setChecked(True)
-        
-        # Clear button
-        clear_button = QPushButton("Clear Logs")
-        clear_button.clicked.connect(self._clear_logs)
-        
-        # Add controls to layout
-        control_layout.addWidget(filter_label)
-        control_layout.addWidget(self.filter_input)
-        control_layout.addWidget(severity_label)
-        control_layout.addWidget(self.severity_filter)
-        control_layout.addWidget(self.auto_scroll)
-        control_layout.addWidget(clear_button)
-        
-        # Log display
-        self.log_display = QTextEdit()
-        self.log_display.setReadOnly(True)
-        self.log_display.setLineWrapMode(QTextEdit.NoWrap)
-        self.log_display.setStyleSheet("""
-            QTextEdit {
-                background-color: #1a1a1a;
-                color: white;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 9pt;
-                border: none;
+        # Top area with statistics
+        stats_frame = QFrame()
+        stats_frame.setFrameShape(QFrame.StyledPanel)
+        stats_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2d2d30;
+                border: 1px solid #3f3f46;
             }
         """)
         
-        # Create timeline view
-        self.timeline = QWidget()
-        timeline_layout = QVBoxLayout(self.timeline)
-        timeline_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout = QHBoxLayout(stats_frame)
         
-        # Timeline visualization component
-        self.timeline_view = TimelineView()
-        self.timeline_view.setMinimumHeight(100)
-        self.timeline_view.setMaximumHeight(200)
-        
-        # Configure timeline settings from config
-        refresh_interval = 1000  # Default refresh interval
-        if self.config:
-            refresh_interval = self.config.get("gui_config", {}).get("refresh_interval", 1000)
-        self.timeline_view.setRefreshInterval(refresh_interval)
-        
-        # Connect signals
-        self.timeline_view.eventSelected.connect(self._on_timeline_event_selected)
-        timeline_layout.addWidget(self.timeline_view)
-        
-        # No need to start a timer now
-        
-        # Add timeline controls
-        timeline_controls = QHBoxLayout()
-        zoom_in_btn = QPushButton("Zoom In")
-        zoom_out_btn = QPushButton("Zoom Out")
-        reset_view_btn = QPushButton("Reset View")
-        
-        zoom_in_btn.clicked.connect(self.timeline_view.zoomIn)
-        zoom_out_btn.clicked.connect(self.timeline_view.zoomOut)
-        reset_view_btn.clicked.connect(self.timeline_view.resetView)
-        
-        timeline_controls.addStretch()
-        timeline_controls.addWidget(zoom_in_btn)
-        timeline_controls.addWidget(zoom_out_btn)
-        timeline_controls.addWidget(reset_view_btn)
-        timeline_layout.addLayout(timeline_controls)
-        # showing events on a horizontal timeline
-        timeline_placeholder = QLabel("Timeline Visualization")
-        timeline_placeholder.setAlignment(Qt.AlignCenter)
-        timeline_placeholder.setStyleSheet("color: gray; border: 1px dashed gray; padding: 10px;")
-        timeline_layout.addWidget(timeline_placeholder)
-        
-        # Status label for entry count
-        self.status_label = QLabel(f"Log entries: 0/{self.max_entries}")
-        
-        # Add all widgets to main layout
-        main_layout.addLayout(control_layout)
-        main_layout.addWidget(self.log_display, 3)  # 3:1 ratio (logs:timeline)
-        main_layout.addWidget(self.timeline, 1)
-        main_layout.addWidget(self.status_label)
-    
-    def _setup_filters(self):
-        """Initialize filter settings"""
-        self.filters = {
-            'severity': None,  # None means no filter
-            'category': None,
-            'text_search': None
-        }
-    
-    def _on_timeline_event_selected(self, event_data):
-        """Handle when a timeline event is selected"""
-        if event_data:
-            # Find the log entry for this event and highlight it
-            timestamp = event_data.get('timestamp')
-            if timestamp:
-                # Find the log entry with this timestamp
-                for i, entry in enumerate(self.filtered_entries):
-                    if abs(entry.timestamp - timestamp) < 0.1:  # Small threshold for floating-point comparison
-                        # Highlight this entry
-                        self._highlight_log_entry(i)
-                        break
-    
-    def _highlight_log_entry(self, index):
-        """Highlight a specific log entry"""
-        # This would typically scroll to the entry and highlight it
-        # For now we'll just log it
-        if 0 <= index < len(self.filtered_entries):
-            logger.debug(f"Highlighting log entry: {self.filtered_entries[index].message}")
-    
-    def _apply_filters(self):
-        """Apply current filters to the log entries"""
-        # Get filter values
-        severity_filter = self.severity_filter.currentText()
-        if severity_filter == "All Levels":
-            self.filters['severity'] = None
-        else:
-            self.filters['severity'] = severity_filter
-        
-        # Apply filters
-        self.filtered_entries = []
-        for entry in self.log_entries:
-            if self._entry_matches_filters(entry):
-                self.filtered_entries.append(entry)
-        
-        # Update display
-        self._update_display()
-    
-    def _entry_matches_filters(self, entry: LogEntry) -> bool:
-        """Check if entry matches current filters"""
-        # Check severity filter
-        if self.filters['severity'] is not None:
-            if entry.severity != self.filters['severity']:
-                return False
-        
-        # Check text search
-        if self.filters['text_search'] is not None:
-            if self.filters['text_search'].lower() not in entry.message.lower():
-                return False
-        
-        return True
-    
-    def _update_display(self):
-        """Update log display with filtered entries"""
-        self.log_display.clear()
-        
-        # Build HTML content
-        html_content = '<div style="font-family: Consolas, \'Courier New\', monospace;">'
-        
-        for entry in self.filtered_entries:
-            html_content += entry.get_html()
-        
-        html_content += '</div>'
-        
-        # Set HTML content
-        self.log_display.setHtml(html_content)
-        
-        # Auto-scroll to bottom if enabled
-        if self.auto_scroll.isChecked():
-            cursor = self.log_display.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.log_display.setTextCursor(cursor)
-    
-    def _clear_logs(self):
-        """Clear all log entries"""
-        self.log_entries = []
-        self.filtered_entries = []
-        self.log_display.clear()
-    
-    def add_log_entry(self, message: str, severity: str = "INFO", timestamp=None):
-        """Add a new log entry."""
-        # Create new log entry
-        entry = LogEntry(message=message, severity=severity, timestamp=timestamp)
-        
-        # Add to log entries
-        self.log_entries.append(entry)
-        
-        # Check if we need to truncate
-        if len(self.log_entries) > self.max_entries:
-            self.log_entries = self.log_entries[-self.max_entries:]
-        
-        # Apply filters
-        if self._entry_matches_filters(entry):
-            self.filtered_entries.append(entry)
+        # Statistics blocks
+        self.stat_widgets = {}
+        for stat_name, default_value, tooltip in [
+            ("Files Processed", "0", "Total number of files analyzed"),
+            ("Elapsed Time", "00:00", "Total scanning time"),
+            ("Medium Risk", "0", "Files with medium risk score"),
+            ("High Risk", "0", "Files with high risk score"),
+            ("Critical Risk", "0", "Files with critical risk score")
+        ]:
+            stat_widget = QWidget()
+            stat_layout = QVBoxLayout(stat_widget)
+            stat_layout.setContentsMargins(5, 5, 5, 5)
             
-            # Update the display with the new entry
-            self._update_display_with_entry(entry)
+            # Stat label
+            label = QLabel(stat_name)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("color: #cccccc; font-size: 9pt;")
             
-            # Update the timeline
-            self._update_timeline()
+            # Stat value
+            value = QLabel(default_value)
+            value.setAlignment(Qt.AlignCenter)
+            value.setStyleSheet("color: #ffffff; font-size: 14pt; font-weight: bold;")
+            
+            stat_layout.addWidget(label)
+            stat_layout.addWidget(value)
+            
+            stats_layout.addWidget(stat_widget)
+            
+            # Store reference for later updates
+            self.stat_widgets[stat_name] = value
+            
+            # Set tooltip
+            stat_widget.setToolTip(tooltip)
         
-        # Update entry count
-        self.status_label.setText(f"Log entries: {len(self.log_entries)}/{self.max_entries}")
+        layout.addWidget(stats_frame)
         
-        # Log to standard logger as well
-        log_method = getattr(logger, severity.lower(), None)
-        if log_method:
-            log_method(message)
-        else:
-            logger.info(f"[{severity}] {message}")
-
-    def _update_timeline(self):
-        """Update the timeline widget with the latest log entries."""
-        if not hasattr(self, 'timeline_view'):
+        # Progress section
+        progress_layout = QHBoxLayout()
+        
+        # Progress status
+        self.progress_status = QLabel("Ready")
+        progress_layout.addWidget(self.progress_status, 1)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        progress_layout.addWidget(self.progress_bar, 4)
+        
+        layout.addLayout(progress_layout)
+        
+        # Create splitter for log and alert areas
+        splitter = QSplitter(Qt.Vertical)
+        
+        # Log output area
+        self.log_output = LogOutputWidget()
+        splitter.addWidget(self.log_output)
+        
+        # Alerts table
+        alerts_frame = QFrame()
+        alerts_layout = QVBoxLayout(alerts_frame)
+        alerts_layout.setContentsMargins(0, 0, 0, 0)
+        
+        alerts_header = QLabel("File Alerts")
+        alerts_header.setStyleSheet("font-weight: bold; padding: 5px;")
+        alerts_layout.addWidget(alerts_header)
+        
+        self.alerts_table = QTableWidget(0, 3)
+        self.alerts_table.setHorizontalHeaderLabels(["File", "Score", "Severity"])
+        self.alerts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.alerts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.alerts_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.alerts_table.verticalHeader().setVisible(False)
+        self.alerts_table.setSelectionBehavior(QTableWidget.SelectRows)
+        alerts_layout.addWidget(self.alerts_table)
+        
+        splitter.addWidget(alerts_frame)
+        
+        # Set initial sizes
+        splitter.setSizes([300, 200])
+        
+        layout.addWidget(splitter)
+        
+        # Add initial log message
+        self.add_log_entry("Live monitoring initialized and ready", "INFO")
+    
+    def add_file_alert(self, file_path, score, severity):
+        """Add a file alert to the alerts table."""
+        # Ensure this is called from the main thread
+        if QThread.currentThread() != self.main_thread:
+            QTimer.singleShot(0, lambda: self.add_file_alert(file_path, score, severity))
             return
             
-        # Convert log entries to timeline events
-        events = []
-        for entry in self.filtered_entries:
-            severity_color = self.severity_colors.get(entry.severity, QColor(200, 200, 200))
-            event = {
-                'timestamp': entry.timestamp,
-                'label': entry.message[:20] + '...' if len(entry.message) > 20 else entry.message,
-                'color': severity_color.name(),
-                'details': entry.message
-            }
-            events.append(event)
+        # Add to table
+        row = self.alerts_table.rowCount()
+        self.alerts_table.insertRow(row)
+        
+        # File path
+        self.alerts_table.setItem(row, 0, QTableWidgetItem(file_path))
+        
+        # Score
+        score_item = QTableWidgetItem(f"{score:.2f}")
+        score_item.setTextAlignment(Qt.AlignCenter)
+        self.alerts_table.setItem(row, 1, score_item)
+        
+        # Severity
+        severity_item = QTableWidgetItem(severity)
+        severity_item.setTextAlignment(Qt.AlignCenter)
+        
+        # Set background color based on severity
+        if severity == "HIGH":
+            severity_item.setBackground(QColor(244, 67, 54, 100))  # Red
+        elif severity == "MEDIUM":
+            severity_item.setBackground(QColor(255, 193, 7, 100))  # Yellow
+        elif severity == "CRITICAL":
+            severity_item.setBackground(QColor(183, 28, 28, 100))  # Dark Red
+        
+        self.alerts_table.setItem(row, 2, severity_item)
+        
+        # Update counter
+        if severity in self.file_counts:
+            self.file_counts[severity] += 1
+        
+        # Sort by severity (most severe at top)
+        self.alerts_table.sortItems(2, Qt.DescendingOrder)
+    
+    def add_log_entry(self, message, severity="INFO"):
+        """Add a log entry to the log output."""
+        # Ensure this is called from the main thread
+        if QThread.currentThread() != self.main_thread:
+            QTimer.singleShot(0, lambda: self.add_log_entry(message, severity))
+            return
             
-        # Update timeline with events
-        self.timeline_view.setEvents(events)
+        # Add to log widget
+        self.log_output.add_log_entry(message, severity)
         
-        # Manually update timeline instead of relying on timer
-        self.timeline_view.manualUpdate()
-
-    def cleanup(self):
-        """Clean up resources when the widget is about to be destroyed."""
-        # No timer to stop in TimelineView anymore
-        pass
+        # Also log to Python logger if it's a warning or error
+        if severity.upper() in ["WARNING", "ERROR", "CRITICAL"]:
+            log_method = getattr(logger, severity.lower(), logger.info)
+            log_method(message)
+    
+    def update_progress(self, current, total, status_text=None):
+        """Update the progress bar."""
+        # Ensure this is called from the main thread
+        if QThread.currentThread() != self.main_thread:
+            QTimer.singleShot(0, lambda: self.update_progress(current, total, status_text))
+            return
+            
+        # Start timer if not started
+        if self.start_time is None:
+            self.start_time = time.time()
         
-    def __del__(self):
-        """Destructor to ensure cleanup is called."""
-        self.cleanup()
-
-    def _update_display_with_entry(self, entry):
-        """Update the display with a single log entry."""
-        cursor = self.log_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_display.setTextCursor(cursor)
+        # Update progress bar
+        if total > 0:
+            percent = min(100, int((current / total) * 100))
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"{percent}% ({current}/{total} files)")
+        else:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("0%")
         
-        # Add HTML
-        self.log_display.insertHtml(entry.get_html())
+        # Update status text if provided
+        if status_text:
+            self.progress_status.setText(status_text)
+    
+    def update_statistics(self):
+        """Update the statistics display."""
+        # Ensure this is called from the main thread
+        if QThread.currentThread() != self.main_thread:
+            QTimer.singleShot(0, self.update_statistics)
+            return
+            
+        # Update file count
+        self.stat_widgets["Files Processed"].setText(str(self.files_processed))
         
-        # Auto-scroll if enabled
-        if self.auto_scroll.isChecked():
-            cursor.movePosition(QTextCursor.End)
-            self.log_display.setTextCursor(cursor) 
+        # Update risk counts
+        self.stat_widgets["Medium Risk"].setText(str(self.file_counts.get("MEDIUM", 0)))
+        self.stat_widgets["High Risk"].setText(str(self.file_counts.get("HIGH", 0)))
+        self.stat_widgets["Critical Risk"].setText(str(self.file_counts.get("CRITICAL", 0)))
+        
+        # Update elapsed time if scan has started
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            self.stat_widgets["Elapsed Time"].setText(f"{minutes:02d}:{seconds:02d}")
+    
+    def reset(self):
+        """Reset the monitor state."""
+        # Ensure this is called from the main thread
+        if QThread.currentThread() != self.main_thread:
+            QTimer.singleShot(0, self.reset)
+            return
+            
+        # Reset counters
+        self.files_processed = 0
+        self.start_time = None
+        self.file_counts = {
+            "LOW": 0,
+            "MEDIUM": 0, 
+            "HIGH": 0,
+            "CRITICAL": 0
+        }
+        
+        # Reset progress
+        self.progress_bar.setValue(0)
+        self.progress_status.setText("Ready")
+        
+        # Clear alerts table
+        self.alerts_table.setRowCount(0)
+        
+        # Add log entry
+        self.add_log_entry("Monitor reset and ready for new scan", "INFO")
+        
+        # Update stats to show zeros
+        self.update_statistics() 

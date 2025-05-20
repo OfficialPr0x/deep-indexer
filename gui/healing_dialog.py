@@ -248,18 +248,27 @@ class HealingDialog(QDialog):
         if level >= logging.ERROR:
             color = "#FF5252"  # Red for errors
         elif level >= logging.WARNING:
-            color = "#FFC107"  # Yellow for warnings
+            color = "#FFD740"  # Yellow/amber for warnings
         elif level >= logging.INFO:
             color = "#FFFFFF"  # White for info
         else:
-            color = "#AAAAAA"  # Gray for debug
+            color = "#B0B0B0"  # Gray for debug/trace
         
-        self.log_widget.append(f"<span style='color: {color}'>{message}</span>")
-        
-        # Autoscroll
+        # Use invokeMethod to ensure this runs in the UI thread
+        self._append_to_log(f'<span style="color:{color}">{message}</span>')
+    
+    def _append_to_log(self, html_text):
+        """Safely append text to log in the UI thread."""
+        # Store current cursor position
         cursor = self.log_widget.textCursor()
         cursor.movePosition(QTextCursor.End)
+        
+        # Insert formatted text
+        cursor.insertHtml(html_text + "<br>")
+        
+        # Auto-scroll to bottom
         self.log_widget.setTextCursor(cursor)
+        self.log_widget.ensureCursorVisible()
     
     def update_healing_progress(self, event_type, data):
         """Update healing progress based on events from DeepSeek."""
@@ -318,37 +327,56 @@ class HealingDialog(QDialog):
 
 
 class HealingManager:
-    """
-    Manager for self-healing processes.
-    Displays and handles healing dialogs.
-    """
+    """Manages self-healing dialogs for the application."""
     
     def __init__(self, parent=None):
-        """Initialize healing manager."""
         self.parent = parent
         self.active_dialogs = {}
+        self.main_thread = QThread.currentThread()
     
     def start_healing_process(self, error_type, context=None):
-        """Start a healing process for the specified error type."""
+        """Start a new healing process dialog."""
+        # Check if we're in the main thread
+        if QThread.currentThread() != self.main_thread:
+            # If not, schedule this to run in the main thread
+            QTimer.singleShot(0, lambda: self.start_healing_process(error_type, context))
+            return
+            
         # Check if there's already a dialog for this error type
-        if error_type in self.active_dialogs and self.active_dialogs[error_type].isVisible():
-            # Just bring it to front
-            self.active_dialogs[error_type].raise_()
-            self.active_dialogs[error_type].activateWindow()
-            return self.active_dialogs[error_type]
-        
-        # Create a new healing dialog
+        if error_type in self.active_dialogs:
+            # Dialog already exists, just update it
+            dialog = self.active_dialogs[error_type]
+            if hasattr(dialog, 'update_healing_progress'):
+                dialog.update_healing_progress('start', context or {})
+            return
+            
+        # Create new dialog
         dialog = HealingDialog(self.parent, error_type, context)
+        dialog.show()
+        
+        # Store reference
         self.active_dialogs[error_type] = dialog
         
-        # Show the dialog (non-blocking)
-        dialog.show()
-        return dialog
+        # Connect finished signal to remove from active dialogs
+        dialog.finished.connect(lambda: self._on_dialog_closed(error_type))
     
     def update_healing_progress(self, error_type, event_type, data):
-        """Update the healing progress for a specific error type."""
-        if error_type in self.active_dialogs and self.active_dialogs[error_type].isVisible():
-            self.active_dialogs[error_type].update_healing_progress(event_type, data)
+        """Update an existing healing dialog."""
+        # Check if we're in the main thread
+        if QThread.currentThread() != self.main_thread:
+            # If not, schedule this to run in the main thread
+            QTimer.singleShot(0, lambda: self.update_healing_progress(error_type, event_type, data))
+            return
+            
+        # Find dialog
+        dialog = self.active_dialogs.get(error_type)
+        if dialog and hasattr(dialog, 'update_healing_progress'):
+            dialog.update_healing_progress(event_type, data)
+            
+    def _on_dialog_closed(self, error_type):
+        """Handle dialog closed event."""
+        if error_type in self.active_dialogs:
+            del self.active_dialogs[error_type]
 
 
 # Test function

@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 import mimetypes
 import random
+import threading
 
 import numpy as np
 from tqdm import tqdm
@@ -203,6 +204,48 @@ class DeepSeekEngine:
         """Set callback function for healing notifications."""
         self.healing_callback = callback
     
+    def _apply_healing_action(self, error_type, context=None):
+        """
+        Apply healing action based on error type.
+        Returns True if healing action was successful, False otherwise.
+        """
+        healing_successful = False
+        
+        # Track the thread we're running in
+        thread_id = threading.get_ident()
+        is_main_thread = threading.main_thread().ident == thread_id
+        
+        try:
+            # Log that we're applying healing
+            self.logger.info(f"Applying healing action for {error_type} (in {'main' if is_main_thread else 'worker'} thread)")
+            
+            # Apply appropriate healing strategy based on error type
+            if error_type == 'API_TIMEOUT':
+                healing_successful = self._reinitialize_api_client()
+            elif error_type == 'RATE_LIMIT':
+                healing_successful = self._handle_rate_limiting()
+            elif error_type == 'TOKEN_ERROR':
+                healing_successful = self._verify_credentials()
+            elif error_type == 'NETWORK_ERROR':
+                healing_successful = self._check_network_connectivity()
+            elif error_type == 'SERVER_ERROR':
+                healing_successful = self._handle_server_error()
+            else:
+                # Generic healing attempt
+                healing_successful = self._reinitialize_api_client()
+            
+            # Log healing result
+            if healing_successful:
+                self.logger.info(f"Healing action successful for {error_type}")
+            else:
+                self.logger.warning(f"Healing action failed for {error_type}")
+            
+            return healing_successful
+            
+        except Exception as e:
+            self.logger.error(f"Error during healing action for {error_type}: {str(e)}")
+            return False
+    
     def _trigger_self_healing(self, error_type, exception=None, context=None):
         """
         Trigger self-healing procedures based on error type.
@@ -228,14 +271,23 @@ class DeepSeekEngine:
             'description': 'Generic error recovery'
         })
         
-        # Notify via callback if available
+        # Notify via callback if available - using threading.Thread to avoid blocking with UI
         if self.healing_callback:
-            self.healing_callback('start', {
+            # Create callback data
+            callback_data = {
                 'error_type': error_type,
                 'strategy': strategy['description'],
                 'max_retries': strategy['max_retries'],
                 'timestamp': time.time()
-            })
+            }
+            
+            # Call in a separate thread to avoid blocking
+            thread = threading.Thread(
+                target=self.healing_callback,
+                args=('start', callback_data)
+            )
+            thread.daemon = True
+            thread.start()
         
         # Try to recover based on the error type
         retry_count = 0
@@ -248,92 +300,91 @@ class DeepSeekEngine:
                 )
                 
                 if strategy['jitter']:
-                    backoff_time = backoff_time * (0.5 + random.random())
+                    # Add random jitter (±20%)
+                    jitter = backoff_time * 0.2 * (random.random() * 2 - 1)
+                    backoff_time += jitter
                 
                 # Log retry attempt
-                self.logger.info(f"Healing attempt {retry_count+1}/{strategy['max_retries']} for {error_type}. "
-                               f"Backing off for {backoff_time:.2f}s")
+                self.logger.info(f"Healing attempt {retry_count + 1}/{strategy['max_retries']} for {error_type}. "
+                                f"Waiting {backoff_time:.2f}s before retry.")
                 
                 # Notify progress via callback
                 if self.healing_callback:
-                    self.healing_callback('progress', {
+                    progress_data = {
                         'error_type': error_type,
                         'retry': retry_count + 1,
                         'max_retries': strategy['max_retries'],
-                        'backoff': backoff_time,
+                        'wait_time': backoff_time,
                         'timestamp': time.time()
-                    })
+                    }
+                    
+                    # Call in a separate thread to avoid blocking
+                    thread = threading.Thread(
+                        target=self.healing_callback,
+                        args=('progress', progress_data)
+                    )
+                    thread.daemon = True
+                    thread.start()
                 
-                # Wait for backoff period
+                # Wait before retry
                 time.sleep(backoff_time)
                 
-                # Apply healing action based on error type
-                healing_success = self._apply_healing_action(error_type, context)
-                
-                if healing_success:
-                    self.logger.info(f"Self-healing successful for {error_type} on attempt {retry_count+1}")
+                # Apply healing action
+                if self._apply_healing_action(error_type, context):
+                    # Healing was successful
+                    self.logger.info(f"Self-healing successful for {error_type} after {retry_count + 1} attempts")
                     
-                    # Notify success via callback
+                    # Update health status
+                    self.health_status = "HEALTHY"
+                    
+                    # Notify success
                     if self.healing_callback:
-                        self.healing_callback('success', {
+                        success_data = {
                             'error_type': error_type,
                             'attempts': retry_count + 1,
                             'timestamp': time.time()
-                        })
+                        }
+                        
+                        # Call in a separate thread to avoid blocking
+                        thread = threading.Thread(
+                            target=self.healing_callback,
+                            args=('success', success_data)
+                        )
+                        thread.daemon = True
+                        thread.start()
                     
-                    self.health_status = "HEALTHY"
                     return True
-            
-            except Exception as e:
-                self.logger.error(f"Healing attempt {retry_count+1} failed with: {str(e)}")
                 
-            retry_count += 1
+                # Increment retry counter
+                retry_count += 1
+                
+            except Exception as e:
+                self.logger.error(f"Error during healing attempt {retry_count + 1}: {str(e)}")
+                retry_count += 1
         
-        # Failed to heal after all retries
+        # All retry attempts failed
         self.logger.error(f"Self-healing failed for {error_type} after {strategy['max_retries']} attempts")
-        self.health_status = "DEGRADED"
         
-        # Notify failure via callback
+        # Update health status
+        self.health_status = "UNHEALTHY"
+        
+        # Notify failure
         if self.healing_callback:
-            self.healing_callback('failure', {
+            failure_data = {
                 'error_type': error_type,
-                'attempts': strategy['max_retries'],
+                'attempts': retry_count,
                 'timestamp': time.time()
-            })
+            }
+            
+            # Call in a separate thread to avoid blocking
+            thread = threading.Thread(
+                target=self.healing_callback,
+                args=('failure', failure_data)
+            )
+            thread.daemon = True
+            thread.start()
         
         return False
-    
-    def _apply_healing_action(self, error_type, context=None):
-        """Apply specific healing action based on error type."""
-        context = context or {}
-        
-        if error_type == 'API_TIMEOUT':
-            # Verify API connectivity and retry
-            return self._verify_api_connectivity()
-        
-        elif error_type == 'RATE_LIMIT':
-            # Wait longer and retry with token bucket algorithm
-            return self._handle_rate_limiting()
-        
-        elif error_type == 'TOKEN_ERROR':
-            # Attempt to refresh/verify credentials
-            return self._verify_credentials()
-        
-        elif error_type == 'NETWORK_ERROR':
-            # Check network connectivity
-            return self._check_network_connectivity()
-        
-        elif error_type == 'SERVER_ERROR':
-            # Check server status and potentially switch endpoints
-            return self._handle_server_error()
-        
-        elif error_type == 'API_INIT_ERROR':
-            # Attempt to reinitialize API client
-            return self._reinitialize_api_client()
-        
-        else:
-            # Generic healing - reinitialize client
-            return self._reinitialize_api_client()
     
     def _reinitialize_api_client(self):
         """Reinitialize the API client."""

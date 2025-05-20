@@ -114,6 +114,11 @@ class MainWindow(QMainWindow):
         # Extract error type from data
         error_type = data.get('error_type', 'UNKNOWN_ERROR')
         
+        # Use QTimer.singleShot to ensure GUI operations happen in the main thread
+        QTimer.singleShot(0, lambda: self._process_healing_event(event_type, error_type, data))
+    
+    def _process_healing_event(self, event_type, error_type, data):
+        """Process healing events in the main thread."""
         if event_type == 'start':
             # Start a new healing process dialog
             context = {

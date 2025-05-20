@@ -129,3 +129,32 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - Built with PySide6 (Qt for Python)
 - Visualization powered by matplotlib and networkx 
+
+## Troubleshooting
+
+### QBasicTimer Issues
+
+If you encounter errors like `QBasicTimer::start: QBasicTimer can only be used with threads started with QThread`, this is due to threading issues when GUI operations are performed from non-GUI threads. We've implemented the following fixes:
+
+1. **GUI Operations in Main Thread**: All GUI operations are now properly marshaled to the main thread using `QTimer.singleShot(0, lambda: ...)` pattern.
+
+2. **Thread-Safe Healing Dialog**: The healing manager has been modified to ensure dialogs are created and updated only in the main thread.
+
+3. **Non-Blocking Callbacks**: DeepSeek engine callbacks now run in separate threads to avoid blocking the main thread.
+
+4. **Safe Log Handling**: Log messages are now properly displayed without causing QBasicTimer errors by ensuring they are processed in the UI thread.
+
+If you still experience issues:
+
+1. Check that any new code that interacts with GUI elements is properly marshaled to the main thread
+2. Use the thread-safe methods in the LiveMonitorWidget for adding log entries and file alerts
+3. Ensure all callbacks from non-GUI threads to GUI code use proper thread synchronization
+
+### Other Common Issues
+
+If the healing system doesn't seem to work:
+
+1. Check that the DeepSeek engine is properly initialized
+2. Verify that API credentials are correct (if using online mode)
+3. Check the logs for any specific error messages
+4. Try running with `--debug` flag for more detailed logging 
